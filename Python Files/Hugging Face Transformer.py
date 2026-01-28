@@ -21,31 +21,29 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
+import torch.nn.init as init
 
-from ... import initialization as init
-from ...activations import ACT2FN, get_activation
-from ...cache_utils import Cache, DynamicCache, EncoderDecoderCache
-from ...generation import GenerationMixin
-from ...masking_utils import create_causal_mask
-from ...modeling_attn_mask_utils import _prepare_4d_attention_mask_for_sdpa
-from ...modeling_layers import GradientCheckpointingLayer
-from ...modeling_outputs import (
-    BaseModelOutputWithPastAndCrossAttentions,
-    CausalLMOutputWithCrossAttentions,
-    QuestionAnsweringModelOutput,
-    SequenceClassifierOutputWithPast,
-    TokenClassifierOutput,
-)
-from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
-from ...pytorch_utils import Conv1D
-from ...utils import (
+# --- FIX: Pointing to the installed 'transformers' library instead of local files ---
+from transformers.activations import ACT2FN, get_activation
+from transformers.cache_utils import Cache, DynamicCache, EncoderDecoderCache
+from transformers.generation import GenerationMixin
+from transformers.modeling_utils import PreTrainedModel
+from transformers.utils import (
     ModelOutput,
-    auto_docstring,
     logging,
 )
-from ...utils.generic import is_flash_attention_requested, maybe_autocast
-from .configuration_gpt2 import GPT2Config
+from transformers.models.gpt2.configuration_gpt2 import GPT2Config
 
+# Note: Some internal functions are harder to import directly. 
+# For a thesis, it is often easier to copy these helper classes 
+# directly into your file if the imports below fail.
+from transformers.modeling_attn_mask_utils import _prepare_4d_attention_mask_for_sdpa
+from transformers.pytorch_utils import Conv1D
+from transformers.modeling_outputs import (
+    BaseModelOutputWithPastAndCrossAttentions,
+    CausalLMOutputWithCrossAttentions
+)
+from transformers.models.gpt2.modeling_gpt2 import create_causal_mask
 
 logger = logging.get_logger(__name__)
 
@@ -242,24 +240,15 @@ class GPT2Attention(nn.Module):
             if is_cross_attention:
                 past_key_values.is_updated[self.layer_idx] = True
 
-        using_eager = self.config._attn_implementation == "eager"
-        attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
-
-        if using_eager and self.reorder_and_upcast_attn:
-            attn_output, attn_weights = self._upcast_and_reordered_attn(
-                query_states, key_states, value_states, attention_mask
-            )
-        else:
-            attn_output, attn_weights = attention_interface(
-                self,
-                query_states,
-                key_states,
-                value_states,
-                attention_mask,
-                dropout=self.attn_dropout.p if self.training else 0.0,
-                **kwargs,
+        attention_interface = eager_attention_forward
+        attn_output, attn_weights = attention_interface(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            dropout=self.attn_dropout.p if self.training else 0.0,
+            **kwargs,
             )
 
         attn_output = attn_output.reshape(*attn_output.shape[:-2], -1).contiguous()
@@ -285,8 +274,7 @@ class GPT2MLP(nn.Module):
         hidden_states = self.dropout(hidden_states)
         return hidden_states
 
-
-class GPT2Block(GradientCheckpointingLayer):
+class GPT2Block(nn.Module):
     def __init__(self, config, layer_idx=None):
         super().__init__()
         hidden_size = config.hidden_size
@@ -362,7 +350,6 @@ class GPT2Block(GradientCheckpointingLayer):
 
         return outputs
 
-@auto_docstring
 class GPT2PreTrainedModel(PreTrainedModel):
     config: GPT2Config
     base_model_prefix = "transformer"
@@ -391,8 +378,7 @@ class GPT2PreTrainedModel(PreTrainedModel):
             init.ones_(module.weight)
         elif isinstance(module, GPT2Attention):
             max_positions = module.config.max_position_embeddings
-            init.copy_(
-                module.bias,
+            module.bias.copy_(
                 torch.tril(torch.ones((max_positions, max_positions), dtype=torch.bool)).view(
                     1, 1, max_positions, max_positions
                 ),
@@ -410,7 +396,6 @@ class GPT2PreTrainedModel(PreTrainedModel):
                     # Special Scaled Initialization --> There are 2 Layer Norms per Transformer Block
                     init.normal_(p, mean=0.0, std=self.config.initializer_range / math.sqrt(2 * self.config.n_layer))
 
-@auto_docstring
 class GPT2Model(GPT2PreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
@@ -436,7 +421,6 @@ class GPT2Model(GPT2PreTrainedModel):
     def set_input_embeddings(self, new_embeddings):
         self.wte = new_embeddings
 
-    @auto_docstring
     def forward(
         self,
         input_ids: torch.LongTensor | None = None,
@@ -610,16 +594,7 @@ class GPT2Model(GPT2PreTrainedModel):
             cross_attentions=all_cross_attentions,
         )
 
-
-@auto_docstring(
-    custom_intro="""
-    The GPT2 Model transformer with a language modeling head on top (linear layer with weights tied to the input
-    embeddings).
-    """
-)
 class GPT2LMHeadModel(GPT2PreTrainedModel, GenerationMixin):
-    _tied_weights_keys = {"lm_head.weight": "transformer.wte.weight"}
-
     def __init__(self, config):
         super().__init__(config)
         self.transformer = GPT2Model(config)
@@ -629,7 +604,6 @@ class GPT2LMHeadModel(GPT2PreTrainedModel, GenerationMixin):
         # Initialize weights and apply final processing
         self.post_init()
 
-    @auto_docstring
     def forward(
         self,
         input_ids: torch.LongTensor | None = None,
@@ -678,7 +652,6 @@ class GPT2LMHeadModel(GPT2PreTrainedModel, GenerationMixin):
 
         transformer_outputs = self.transformer(
             input_ids=None,
-            past_key_values=past_key_values,
             attention_mask=attention_mask,
             cache_position=cache_position,
             token_type_ids=token_type_ids,
@@ -723,3 +696,44 @@ __all__ = [
     "GPT2Model",
     "GPT2PreTrainedModel",
 ]
+
+if __name__ == "__main__":
+    # 1. Setup the Configuration
+    # We load the standard GPT-2 config, but we inject your Thesis parameters.
+    from transformers import GPT2Config
+    
+    config = GPT2Config(
+        vocab_size=50257,  # Standard GPT-2 size (ignored by our new input layer)
+        n_embd=768,        # Internal vector size
+        n_layer=4,         # Small number for testing (faster)
+        n_head=4,          # Small number for testing
+    )
+    
+    # INJECT YOUR THESIS PARAMS
+    config.input_dim = 5   # Example: 5 time-series variables (Temperature, Pressure, etc.)
+    
+    # 2. Instantiate the Model
+    # We use your new class name (assuming you renamed it, otherwise use GPT2LMHeadModel)
+    print("Initializing model...")
+    model = GPT2LMHeadModel(config) 
+    print("Model initialized!")
+
+    # 3. Create Dummy Data (The "Fake" Time Series)
+    # Shape: [Batch Size=2, Sequence Length=10, Variables=5]
+    batch_size = 2
+    seq_len = 10
+    dummy_input = torch.randn(batch_size, seq_len, config.input_dim)
+    
+    # 4. Create Dummy Labels (For Loss Calculation)
+    # Same shape as input
+    dummy_labels = torch.randn(batch_size, seq_len, config.input_dim)
+
+    # 5. The Forward Pass
+    print("Running forward pass...")
+    outputs = model(inputs_embeds=dummy_input, labels=dummy_labels)
+    
+    # 6. Check the Results
+    print(f"\nSuccess! The data flowed through.")
+    print(f"Input Shape: {dummy_input.shape}")
+    print(f"Output Logits Shape: {outputs.logits.shape}") # Should be [2, 10, 5]
+    print(f"Loss Value: {outputs.loss.item()}")          # Should be a float (e.g., 0.982)
