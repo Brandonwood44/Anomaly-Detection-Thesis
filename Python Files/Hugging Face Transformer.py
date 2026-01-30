@@ -599,7 +599,7 @@ class GPT2LMHeadModel(GPT2PreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.transformer = GPT2Model(config)
         self.embed_projection = nn.Linear(config.input_dim, config.n_embd)
-        self.lm_head = nn.Linear(config.n_embd, config.input_dim, bias=False)
+        self.lm_head = nn.Linear(config.n_embd, config.input_dim, bias=True)
 
         # Initialize weights and apply final processing
         self.post_init()
