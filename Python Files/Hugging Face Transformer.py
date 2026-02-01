@@ -25,7 +25,6 @@ import torch.nn.init as init
 
 # --- FIX: Pointing to the installed 'transformers' library instead of local files ---
 from transformers.activations import ACT2FN
-from transformers.cache_utils import Cache
 from transformers.generation import GenerationMixin
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import (
@@ -121,17 +120,11 @@ class GPT2Attention(nn.Module):
     def forward(
         self,
         hidden_states: tuple[torch.FloatTensor] | None,
-        past_key_values: Cache | None = None,
-        cache_position: torch.LongTensor | None = None,
         attention_mask: torch.FloatTensor | None = None,
         # CLEANUP: Removed encoder_hidden_states / encoder_attention_mask args
         output_attentions: bool | None = False,
         **kwargs,
     ) -> tuple[torch.Tensor | tuple[torch.Tensor], ...]:
-        
-        # CLEANUP: Removed cross-attention cache logic
-        if past_key_values is not None:
-             curr_past_key_values = past_key_values # Simple assignment
 
         # CLEANUP: Removed 'if is_cross_attention' branching
         # Standard Self-Attention Logic
@@ -142,12 +135,6 @@ class GPT2Attention(nn.Module):
 
         shape_q = (*query_states.shape[:-1], -1, self.head_dim)
         query_states = query_states.view(shape_q).transpose(1, 2)
-
-        if past_key_values is not None:
-            # save all key/value_layer to cache
-            key_states, value_states = curr_past_key_values.update(
-                key_states, value_states, self.layer_idx, {"cache_position": cache_position}
-            )
 
         attention_interface = eager_attention_forward
         attn_output, attn_weights = attention_interface(
@@ -200,11 +187,7 @@ class GPT2Block(nn.Module):
     def forward(
         self,
         hidden_states: tuple[torch.FloatTensor] | None,
-        past_key_values: Cache | None = None,
-        cache_position: torch.LongTensor | None = None,
         attention_mask: torch.FloatTensor | None = None,
-        # CLEANUP: Removed encoder args
-        use_cache: bool | None = False,
         output_attentions: bool | None = False,
         **kwargs,
     ) -> tuple[torch.Tensor] | tuple[torch.Tensor, tuple[torch.FloatTensor, ...]] | None:
@@ -212,16 +195,11 @@ class GPT2Block(nn.Module):
         hidden_states = self.ln_1(hidden_states)
         attn_output, self_attn_weights = self.attn(
             hidden_states,
-            past_key_values=past_key_values,
-            cache_position=cache_position,
             attention_mask=attention_mask,
-            use_cache=use_cache,
             output_attentions=output_attentions,
             **kwargs,
         )
         hidden_states = attn_output + residual
-
-        # CLEANUP: Removed 'if encoder_hidden_states is not None' block entirely
 
         residual = hidden_states
         hidden_states = self.ln_2(hidden_states)
@@ -238,7 +216,6 @@ class GPT2PreTrainedModel(PreTrainedModel):
     base_model_prefix = "transformer"
     supports_gradient_checkpointing = True
     _no_split_modules = ["GPT2Block"]
-    _skip_keys_device_placement = "past_key_values"
     _supports_flash_attn = True
     _supports_sdpa = True
     _supports_attention_backend = True
@@ -295,13 +272,9 @@ class GPT2Model(GPT2PreTrainedModel):
 
     def forward(
         self,
-        # CLEANUP: Removed input_ids, token_type_ids (not used in time series)
-        past_key_values: Cache | None = None,
-        cache_position: torch.LongTensor | None = None,
         attention_mask: torch.FloatTensor | None = None,
         position_ids: torch.LongTensor | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
-        use_cache: bool | None = None,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         return_dict: bool | None = None,
@@ -311,7 +284,6 @@ class GPT2Model(GPT2PreTrainedModel):
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
-        use_cache = use_cache if use_cache is not None else self.config.use_cache
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         if inputs_embeds is None:
@@ -321,14 +293,6 @@ class GPT2Model(GPT2PreTrainedModel):
         batch_size = inputs_embeds.shape[0]
 
         device = inputs_embeds.device
-
-        if cache_position is None:
-            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-            cache_position = torch.arange(
-                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
-            )
-        if position_ids is None:
-            position_ids = cache_position.unsqueeze(0)
 
         position_embeds = self.pe(position_ids)
         hidden_states = inputs_embeds + position_embeds.to(inputs_embeds.device)
@@ -340,8 +304,6 @@ class GPT2Model(GPT2PreTrainedModel):
             config=self.config,
             input_embeds=inputs_embeds,
             attention_mask=attention_mask,
-            cache_position=cache_position,
-            past_key_values=past_key_values,
             position_ids=position_ids,
         )
 
@@ -357,11 +319,6 @@ class GPT2Model(GPT2PreTrainedModel):
 
             outputs = block(
                 hidden_states,
-                past_key_values if not (self.gradient_checkpointing and self.training) else None,
-                cache_position,
-                causal_mask,
-                # CLEANUP: Removed encoder args here
-                use_cache=use_cache,
                 output_attentions=output_attentions,
                 **kwargs,
             )
@@ -377,17 +334,8 @@ class GPT2Model(GPT2PreTrainedModel):
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
 
-        past_key_values = past_key_values if use_cache else None
-        if not return_dict:
-            return tuple(
-                v
-                for v in [hidden_states, past_key_values, all_hidden_states, all_self_attentions]
-                if v is not None
-            )
-
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
-            past_key_values=past_key_values,
             hidden_states=all_hidden_states,
             attentions=all_self_attentions,
         )
@@ -402,18 +350,15 @@ class GPT2LMHeadModel(GPT2PreTrainedModel, GenerationMixin):
 
     def forward(
         self,
-        past_key_values: Cache | None = None,
-            cache_position: torch.LongTensor | None = None,
-            attention_mask: torch.FloatTensor | None = None,
-            position_ids: torch.LongTensor | None = None,
-            labels: torch.FloatTensor | None = None,
-            use_cache: bool | None = None,
-            output_attentions: bool | None = None,
-            output_hidden_states: bool | None = None,
-            return_dict: bool | None = None,
-            logits_to_keep: int | torch.Tensor = 0,
-            **kwargs,
-            ) -> tuple | CausalLMOutputWithPast:
+        attention_mask: torch.FloatTensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        target_values: torch.FloatTensor | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        return_dict: bool | None = None,
+        logits_to_keep: int | torch.Tensor = 0,
+        **kwargs,
+        ) -> tuple | CausalLMOutputWithPast:
         
         # Handle the input projection
         if input_values is not None:
@@ -429,10 +374,7 @@ class GPT2LMHeadModel(GPT2PreTrainedModel, GenerationMixin):
         transformer_outputs = self.transformer(
             inputs_embeds=hidden_states_input,
             attention_mask=attention_mask,
-            cache_position=cache_position,
             position_ids=position_ids,
-            past_key_values=past_key_values,
-            use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
@@ -443,11 +385,10 @@ class GPT2LMHeadModel(GPT2PreTrainedModel, GenerationMixin):
         logits = self.lm_head(hidden_states[:, slice_indices, :])
 
         loss = None
-        if labels is not None:
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:, :].contiguous()
-            loss_fct = nn.MSELoss()
-            loss = loss_fct(shift_logits, shift_labels)
+        if target_values is not None:
+            pred = logits[:, :-1, :]
+            true = target_values[:, 1:, :]
+            loss = nn.MSELoss()(pred, true)
 
         if not return_dict:
             output = (logits,) + transformer_outputs[1:]
@@ -456,7 +397,6 @@ class GPT2LMHeadModel(GPT2PreTrainedModel, GenerationMixin):
         return CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
-            past_key_values=transformer_outputs.past_key_values,
             hidden_states=transformer_outputs.hidden_states,
             attentions=transformer_outputs.attentions,
         )
