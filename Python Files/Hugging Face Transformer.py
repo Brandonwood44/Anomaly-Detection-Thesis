@@ -402,19 +402,18 @@ class GPT2LMHeadModel(GPT2PreTrainedModel, GenerationMixin):
 
     def forward(
         self,
-        input_values: torch.FloatTensor | None = None, # Renamed for clarity
         past_key_values: Cache | None = None,
-        cache_position: torch.LongTensor | None = None,
-        attention_mask: torch.FloatTensor | None = None,
-        position_ids: torch.LongTensor | None = None,
-        labels: torch.LongTensor | None = None,
-        use_cache: bool | None = None,
-        output_attentions: bool | None = None,
-        output_hidden_states: bool | None = None,
-        return_dict: bool | None = None,
-        logits_to_keep: int | torch.Tensor = 0,
-        **kwargs,
-    ) -> tuple | CausalLMOutputWithPast: # Cleaner return type
+            cache_position: torch.LongTensor | None = None,
+            attention_mask: torch.FloatTensor | None = None,
+            position_ids: torch.LongTensor | None = None,
+            labels: torch.FloatTensor | None = None,
+            use_cache: bool | None = None,
+            output_attentions: bool | None = None,
+            output_hidden_states: bool | None = None,
+            return_dict: bool | None = None,
+            logits_to_keep: int | torch.Tensor = 0,
+            **kwargs,
+            ) -> tuple | CausalLMOutputWithPast:
         
         # Handle the input projection
         if input_values is not None:
